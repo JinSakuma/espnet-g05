@@ -1,0 +1,5 @@
+#PETER
+beam_size: 20
+transducer_conf:
+    search_type: default
+    score_norm: True
