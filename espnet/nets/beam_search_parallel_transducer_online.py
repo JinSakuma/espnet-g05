@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import copy
+import logging
 
 # from espnet2.asr_ransducer.decoder.abs_decoder import AbsDecoder
 # from espnet2.asr_transducer.joint_network import JointNetwork
@@ -154,6 +155,7 @@ class BeamSearchParallelTransducer:
         self,
         enc_out: torch.Tensor,
         enc_out_r: torch.Tensor,
+        enc_out_rr: torch.Tensor,
         is_final: bool = True,
     ) -> List[Hypothesis]:
         """Perform beam search.
@@ -167,18 +169,35 @@ class BeamSearchParallelTransducer:
         self.decoder.set_device(enc_out.device)
 
         hyps = self.search_algorithm(enc_out)
+        self.search_cache = hyps
+        
+#         #if not is_final:
         self.store()
         hyps_r = self.search_algorithm(enc_out_r)
+        if enc_out_rr is not None:
+            self.search_cache = hyps_r
+            hyps_rr = self.search_algorithm(enc_out_rr)            
+        else:
+            hyps_rr = None            
         self.restore()
         
         if is_final:
+            #logging.warning("is_final")
             self.reset_inference_cache()
+            
+#             out = self.sort_nbest(hyps)
+#             return out, out, out
 
-            return self.sort_nbest(hyps), self.sort_nbest(hyps_r)
+            if hyps_rr is not None:
+                return self.sort_nbest(hyps), self.sort_nbest(hyps_r), self.sort_nbest(hyps_rr)
+            else:
+                return self.sort_nbest(hyps), self.sort_nbest(hyps_r), None        
 
-        self.search_cache = hyps
+        if hyps_rr is not None:
+            return hyps, hyps_r, hyps_rr
+        else:
+            return hyps, hyps_r, None
 
-        return hyps, hyps_r
     
     def store(self):
         """Store parameters."""
@@ -188,7 +207,9 @@ class BeamSearchParallelTransducer:
     def restore(self):
         """Restore parameters."""
         self.decoder.score_cache = self.decoder.score_cache_tmp.copy()
-        self.search_cache = copy.deepcopy(self.search_cache_tmp)              
+        self.search_cache = copy.deepcopy(self.search_cache_tmp)
+        self.decoder.score_cache_tmp = {}
+        self.search_cache_tmp = None
 
     def reset_inference_cache(self) -> None:
         """Reset cache for decoder scoring and streaming."""
@@ -304,9 +325,9 @@ class BeamSearchParallelTransducer:
         for t in range(max_t):
             hyps = kept_hyps
             kept_hyps = []
-            cache = {}
+            cache = {}            
 
-            while True:
+            while True:                
                 max_hyp = max(hyps, key=lambda x: x.score)
                 hyps.remove(max_hyp)
 
@@ -370,14 +391,18 @@ class BeamSearchParallelTransducer:
                     )
 
                 hyps_max = float(max(hyps, key=lambda x: x.score).score)
+                
+                #logging.warning(f"#num kept_hyps: {len(kept_hyps)}")
                 kept_most_prob = sorted(
                     [hyp for hyp in kept_hyps if hyp.score > hyps_max],
                     key=lambda x: x.score,
                 )
+                
+                #logging.warning(f"#num hyps: {len(kept_most_prob)}")
                 if len(kept_most_prob) >= self.beam_size:
                     kept_hyps = kept_most_prob
                     break
-
+                                   
         return kept_hyps
     
     def greedy_search(self, enc_out: torch.Tensor) -> List[Hypothesis]:

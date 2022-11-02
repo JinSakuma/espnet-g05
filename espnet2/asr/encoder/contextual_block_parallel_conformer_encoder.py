@@ -224,6 +224,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         prev_states: torch.Tensor = None,
         is_final=True,
         infer_mode=False,
+        is_3steps: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Embed positions in tensor.
 
@@ -240,7 +241,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         if self.training or not infer_mode:
             return self.forward_train(xs_pad, ilens, prev_states)
         else:
-            return self.forward_infer(xs_pad, ilens, prev_states, is_final)
+            return self.forward_infer(xs_pad, ilens, prev_states, is_final, is_3steps)
 
     def forward_train(
         self,
@@ -438,6 +439,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         ilens: torch.Tensor,
         prev_states: torch.Tensor = None,
         is_final: bool = True,
+        is_3steps: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Embed positions in tensor.
 
@@ -575,7 +577,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         xs_pad_r = torch.cat([xs_pad, mask], dim=1)
         xs_pad_r = xs_pad_r.narrow(1, self.hop_size, xs_pad.size(1))
         
-        if self.num_parallel > 1:
+        if is_3steps:
             xs_pad_rr = torch.cat([xs_pad_r, mask], dim=1)
             xs_pad_rr = xs_pad_rr.narrow(1, self.hop_size, xs_pad.size(1))
         else:
@@ -604,7 +606,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
             bsize, block_num, self.block_size + 2, xs_pad_r.size(-1)
         )
         
-        if self.num_parallel > 1:
+        if is_3steps:
             xs_chunk_rr = xs_pad_rr.new_zeros(
                 bsize, block_num, self.block_size + 2, xs_pad_rr.size(-1)
             )                        
@@ -615,23 +617,23 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
             
             addin = xs_pad.narrow(1, cur_hop, chunk_length)
             addin_r = xs_pad_r.narrow(1, cur_hop, chunk_length)
-            if self.num_parallel > 1:
+            if is_3steps:
                 addin_rr = xs_pad_rr.narrow(1, cur_hop, chunk_length)
             if self.init_average:
                 addin = addin.mean(1, keepdim=True)
                 addin_r = addin_r.mean(1, keepdim=True)
-                if self.num_parallel > 1:
+                if is_3steps:
                     addin_rr = addin_rr.mean(1, keepdim=True)
             else:
                 addin = addin.max(1, keepdim=True)
                 addin_r = addin_r.max(1, keepdim=True)
-                if self.num_parallel > 1:
+                if is_3steps:
                     addin_rr = addin_rr.max(1, keepdim=True)
                 
             if self.ctx_pos_enc:
                 addin = self.pos_enc(addin, i + n_processed_blocks)
                 addin_r = self.pos_enc(addin_r, i + n_processed_blocks)
-                if self.num_parallel > 1:
+                if is_3steps:
                     addin_rr = self.pos_enc(addin_rr, i + n_processed_blocks)
 
             if prev_addin is None:
@@ -642,27 +644,27 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
                 prev_block_length = min(prev_block.size(1), self.block_size) - self.hop_size
                 prev_addin_r = prev_block.narrow(1, prev_block.size(1) - prev_block_length, prev_block_length)
                 prev_addin_r = torch.cat([prev_addin_r, xs_pad.narrow(1, 0, self.hop_size)], dim=1)
-                if self.num_parallel > 1:
+                if is_3steps:
                     prev_block_length = min(prev_block.size(1), self.block_size) - self.hop_size * 2
                     prev_addin_rr = prev_block.narrow(1, prev_block.size(1) - prev_block_length, prev_block_length)
                     prev_addin_rr = torch.cat([prev_addin_rr, xs_pad.narrow(1, 0, self.hop_size * 2)], dim=1)
                     
                 if self.init_average:                    
                     prev_addin_r = prev_addin_r.mean(1, keepdim=True)
-                    if self.num_parallel > 1:
+                    if is_3steps:
                         prev_addin_rr = prev_addin_rr.mean(1, keepdim=True)
                 else:
                     prev_addin_r = prev_addin_r.max(1, keepdim=True)
-                    if self.num_parallel > 1:
+                    if is_3steps:
                         prev_addin_rr = prev_addin_rr.max(1, keepdim=True)
 
                 if self.ctx_pos_enc:
                     prev_addin_r = self.pos_enc(prev_addin_r, max(i + n_processed_blocks - 1, 0))
-                    if self.num_parallel > 1:
+                    if is_3steps:
                         prev_addin_rr = self.pos_enc(prev_addin_rr, max(i + n_processed_blocks - 1, 0))
             else:
                 prev_addin_r = addin_r                
-                if self.num_parallel > 1:
+                if is_3steps:
                     prev_addin_rr = addin_rr
                 
             xs_chunk[:, i, 0] = prev_addin
@@ -671,7 +673,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
             xs_chunk_r[:, i, 0] = prev_addin_r
             xs_chunk_r[:, i, -1] = addin_r
             
-            if self.num_parallel > 1:
+            if is_3steps:
                 xs_chunk_rr[:, i, 0] = prev_addin_rr
                 xs_chunk_rr[:, i, -1] = addin_rr
 
@@ -682,7 +684,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
             
             chunk_r = self.pos_enc(
                 xs_pad_r.narrow(1, cur_hop, chunk_length),
-                cur_hop + self.hop_size * n_processed_blocks + self.look_ahead,
+                cur_hop + self.hop_size * n_processed_blocks,# + self.look_ahead, ## ここダメ
             )
                         
 
@@ -692,10 +694,10 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
             prev_addin = addin
             prev_block = xs_pad.narrow(1, cur_hop, chunk_length)
             
-            if self.num_parallel > 1:
+            if is_3steps:
                 chunk_rr = self.pos_enc(
                     xs_pad_rr.narrow(1, cur_hop, chunk_length),
-                    cur_hop + self.hop_size * n_processed_blocks + self.look_ahead,
+                    cur_hop + self.hop_size * n_processed_blocks, # + self.look_ahead,
                 )
                 xs_chunk_rr[:, i, 1 : chunk_length + 1] = chunk_rr
 
@@ -705,25 +707,46 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         )
         mask_online.narrow(2, 1, self.block_size + 1).narrow(
             3, 0, self.block_size + 1
-        ).fill_(1)        
-
+        ).fill_(1)      
+        
+        if not is_3steps:
+            mask_online_r = xs_pad_r.new_zeros(
+                xs_pad_r.size(0), block_num, self.block_size + 2, self.block_size + 2
+            )
+            mask_online_r.narrow(2, 1, self.block_size + 1).narrow(
+                3, 0, self.block_size + 1 - self.look_ahead   # masking look-ahead frames
+            ).fill_(1)
+        else:
+            mask_online_r = xs_pad_r.new_zeros(
+                xs_pad_r.size(0), block_num, self.block_size + 2, self.block_size + 2
+            )
+            mask_online_r.narrow(2, 1, self.block_size + 1).narrow(
+                3, 0, self.block_size + 1 - (self.look_ahead // 2)   # masking look-ahead frames
+            ).fill_(1)
+            mask_online_rr = xs_pad_rr.new_zeros(
+                xs_pad_rr.size(0), block_num, self.block_size + 2, self.block_size + 2
+            )
+            mask_online_rr.narrow(2, 1, self.block_size + 1).narrow(
+                3, 0, self.block_size + 1 - self.look_ahead   # masking look-ahead frames
+            ).fill_(1)
+                    
         ys_chunk, _, _, _, past_encoder_ctx, _, _ = self.encoders(
             xs_chunk, mask_online, True, past_encoder_ctx
         )
         
         ys_chunk_r, _, _, _, past_encoder_ctx_r, _, _ = self.encoders(
-            xs_chunk_r, mask_online, True, past_encoder_ctx_r
+            xs_chunk_r, mask_online_r, True, past_encoder_ctx_r
         )        
         
-        if self.num_parallel > 1:
+        if is_3steps:
             ys_chunk_rr, _, _, _, past_encoder_ctx_rr, _, _ = self.encoders(
-                xs_chunk_rr, mask_online, True, past_encoder_ctx_rr
+                xs_chunk_rr, mask_online_rr, True, past_encoder_ctx_rr
             )        
 
         # remove addin                
         ys_chunk = ys_chunk.narrow(2, 1, self.block_size)
         ys_chunk_r = ys_chunk_r.narrow(2, 1, self.block_size)        
-        if self.num_parallel > 1:
+        if is_3steps:
             ys_chunk_rr = ys_chunk_rr.narrow(2, 1, self.block_size)
 
         offset = self.block_size - self.look_ahead - self.hop_size
@@ -732,27 +755,27 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
             if n_processed_blocks == 0:
                 y_length = xs_pad.size(1)
                 y_r_length = xs_pad_r.size(1)
-                if self.num_parallel > 1:
+                if is_3steps:
                     y_rr_length = xs_pad_rr.size(1)
             else:
                 y_length = xs_pad.size(1) - offset
                 y_r_length = xs_pad_r.size(1) - offset
-                if self.num_parallel > 1:
+                if is_3steps:
                     y_rr_length = xs_pad_rr.size(1) - offset
         else:
             y_length = block_num * self.hop_size
             y_r_length = block_num * self.hop_size
-            if self.num_parallel > 1:
+            if is_3steps:
                 y_rr_length = block_num * self.hop_size
             if n_processed_blocks == 0:
                 y_length += offset
                 y_r_length += offset
-                if self.num_parallel > 1:
+                if is_3steps:
                     y_rr_length += offset
                 
         ys_pad = xs_pad.new_zeros((xs_pad.size(0), y_length, xs_pad.size(2)))
         ys_pad_r = xs_pad_r.new_zeros((xs_pad_r.size(0), y_r_length, xs_pad_r.size(2)))
-        if self.num_parallel > 1:
+        if is_3steps:
             ys_pad_rr = xs_pad_rr.new_zeros((xs_pad_rr.size(0), y_rr_length, xs_pad_rr.size(2)))
         else:
             ys_pad_rr = None
@@ -760,7 +783,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         if n_processed_blocks == 0:
             ys_pad[:, 0 : offset] = ys_chunk[:, 0, 0 : offset]
             ys_pad_r[:, 0 : offset] = ys_chunk_r[:, 0, 0 : offset]
-            if self.num_parallel > 1:
+            if is_3steps:
                 ys_pad_rr[:, 0 : offset] = ys_chunk_rr[:, 0, 0 : offset]
         for i in range(block_num):
             cur_hop = i * self.hop_size
@@ -781,7 +804,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
                     :, i, offset : offset + chunk_length
                 ]
                 
-            if self.num_parallel > 1:    
+            if is_3steps:    
                 ys_pad_rr[:, cur_hop  : cur_hop + chunk_length] = ys_chunk_rr[
                     :, i, offset : offset + chunk_length
                 ]
@@ -789,7 +812,7 @@ class ContextualBlockParallelConformerEncoder(AbsEncoder):
         if self.normalize_before:
             ys_pad = self.after_norm(ys_pad)
             ys_pad_r = self.after_norm(ys_pad_r)
-            if self.num_parallel > 1:    
+            if is_3steps:    
                 ys_pad_rr = self.after_norm(ys_pad_rr)
 
         if is_final:

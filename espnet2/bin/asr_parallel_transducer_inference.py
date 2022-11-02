@@ -168,11 +168,8 @@ class Speech2Text:
         self.tokenizer = tokenizer
 
         self.beam_search = beam_search
-        self.streaming = streaming
-        self.chunk_size = max(chunk_size, 0)
-        self.left_context = max(left_context, 0)
-        self.right_context = max(right_context, 0)
-
+        self.streaming = streaming       
+                
         if not streaming or chunk_size == 0:
             self.streaming = False
             self.asr_model.encoder.dynamic_chunk_training = False
@@ -184,23 +181,25 @@ class Speech2Text:
             self.frontend_window_size = asr_train_args.frontend_conf["win_length"]
         else:
             self.frontend_window_size = self.n_fft
+            
+        look_ahead = asr_train_args.encoder_conf['look_ahead']
+        hop_size   = asr_train_args.encoder_conf['hop_size']
+        block_size = asr_train_args.encoder_conf['block_size']
+        
+        if look_ahead / hop_size == 1:
+            self.is_3step = False
+            print('2steps')
+        elif look_ahead / hop_size == 2:
+            self.is_3step = True
+            print('3steps')
+        else:
+            raise NotImplemented
 
-#         self.window_size = self.chunk_size + self.right_context
         self.window_size = 20
-
-#         self._raw_ctx = self.asr_model.encoder.get_encoder_input_raw_size(
-#             self.window_size, self.hop_length
-#         )
-        #self._raw_ctx = 800
         size = 4
         kernel_2, stride_2 = 3, 2  # sub = 4
         self._raw_ctx = (((size + 2) * 2) + (kernel_2 - 1) * stride_2) * self.hop_length
         
-
-#         self.last_chunk_length = (
-#             self.asr_model.encoder.embed.min_frame_length + self.right_context + 1
-#         ) * self.hop_length
-        # print(self.frontend_window_size, self.hop_length)
 
         self.reset_inference_cache()
 
@@ -348,35 +347,23 @@ class Speech2Text:
             feats_length,            
             self.encoder_states,
             is_final=is_final,
-            infer_mode=True,            
-        )
+            infer_mode=True,
+            is_3steps=self.is_3step,
+        )        
         
-#         enc_out, _, self.encoder_states = self.asr_model.encoder(
-#             feats,
-#             feats_length,            
-#             self.encoder_states,
-#             is_final=is_final,
-#             infer_mode=True,            
-#         )
-        
-#         enc_out = self.asr_model.encoder.chunk_forward(
-#             feats,
-#             feats_length,
-#             self.num_processed_frames,
-#             left_context=self.left_context,
-#             right_context=self.right_context,
-#         )
-
-        enc_out_r = enc_out[1]
-        enc_out = enc_out[0]
-        nbest_hyps = self.beam_search(enc_out[0], enc_out_r[0], is_final=is_final)
-
-        self.num_processed_frames += self.chunk_size
+        enc_out_r = enc_out[1][0]
+        if self.is_3step:
+            enc_out_rr = enc_out[2][0]            
+        else:            
+            enc_out_rr = None
+            
+        enc_out = enc_out[0][0]
+        nbest_hyps = self.beam_search(enc_out, enc_out_r, enc_out_rr, is_final=is_final)
 
         if is_final:
             self.reset_inference_cache()
-
-        return (nbest_hyps[0], nbest_hyps[1])
+            
+        return (nbest_hyps[0], nbest_hyps[1], nbest_hyps[2])
 
     @torch.no_grad()
     def __call__(self, speech: Union[torch.Tensor, np.ndarray]) -> List[Hypothesis]:
@@ -414,8 +401,8 @@ class Speech2Text:
 
             if self.tokenizer is not None:
                 text = self.tokenizer.tokens2text(token)                             
-                if len(text)>0 and text.split()[-1] == '<NOISE>':
-                    text = ' '.join(text.split()[:-1])
+#                 if len(text)>0 and text.split()[-1] == '<NOISE>':
+#                     text = ' '.join(text.split()[:-1])
             else:
                 text = None
             results.append((text, token, token_int, hyp))
@@ -562,21 +549,6 @@ def inference(
     )
 
     # 3. Build data-iterator
-#     loader = ASRTransducerTask.build_streaming_iterator(
-#         data_path_and_name_and_type,
-#         dtype=dtype,
-#         batch_size=batch_size,
-#         key_file=key_file,
-#         num_workers=num_workers,
-#         preprocess_fn=ASRTransducerTask.build_preprocess_fn(
-#             speech2text.asr_train_args, False
-#         ),
-#         collate_fn=ASRTransducerTask.build_collate_fn(
-#             speech2text.asr_train_args, False
-#         ),
-#         allow_variable_data_keys=allow_variable_data_keys,
-#         inference=True,
-#     )
     loader = ASRTask.build_streaming_iterator(
         data_path_and_name_and_type,
         dtype=dtype,
@@ -599,28 +571,37 @@ def inference(
             assert len(keys) == _bs, f"{len(keys)} != {_bs}"
             batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
             assert len(batch.keys()) == 1
-
+            
+            speech2text.reset_inference_cache()
+            logging.warning("cache reset")
             try:
                 if speech2text.streaming:
                     speech = batch["speech"]
 
                     _steps = len(speech) // speech2text._raw_ctx
+                    if speech2text.is_3step:
+                        _steps -= 1
+                    
                     _end = 0
 
-                    for i in range(_steps):
+                    for i in range(_steps):                        
                         _end = (i + 1) * speech2text._raw_ctx
 
-                        speech2text.streaming_decode(
+                        final_hyps = speech2text.streaming_decode(
                             speech[i * speech2text._raw_ctx : _end], is_final=False
                         )
-
-                    final_hyps = speech2text.streaming_decode(
-                        speech[_end : len(speech)], is_final=True
-                    )
+                    
+                    if _steps < 1:
+                        final_hyps = speech2text.streaming_decode(
+                            speech[_end : len(speech)], is_final=True
+                        )
                 else:
                     final_hyps = speech2text(**batch)
 
-                results = speech2text.hypotheses_to_results(final_hyps[1])
+                if final_hyps[2] is None:
+                    results = speech2text.hypotheses_to_results(speech2text.beam_search.sort_nbest(final_hyps[1]))
+                else:
+                    results = speech2text.hypotheses_to_results(speech2text.beam_search.sort_nbest(final_hyps[2]))
             except TooShortUttError as e:
                 logging.warning(f"Utterance {keys} {e}")
                 hyp = Hypothesis(score=0.0, yseq=[], dec_state=None)
