@@ -56,6 +56,7 @@ def pad_list(xs, pad_value):
     pad = xs[0].new(n_batch, max_len, *xs[0].size()[1:]).fill_(pad_value)
 
     for i in range(n_batch):
+        #logging.warning("Pad: {}, {}, {}".format(n_batch, xs[i].shape, pad.shape))
         pad[i, : xs[i].size(0)] = xs[i]
 
     return pad

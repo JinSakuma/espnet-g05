@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import copy
 import logging
+import time
 
 # from espnet2.asr_ransducer.decoder.abs_decoder import AbsDecoder
 # from espnet2.asr_transducer.joint_network import JointNetwork
@@ -157,6 +158,7 @@ class BeamSearchParallelTransducer:
         enc_out_r: torch.Tensor,
         enc_out_rr: torch.Tensor,
         is_final: bool = True,
+        is_debug: bool = False
     ) -> List[Hypothesis]:
         """Perform beam search.
         Args:
@@ -168,31 +170,47 @@ class BeamSearchParallelTransducer:
         """
         self.decoder.set_device(enc_out.device)
 
-        hyps = self.search_algorithm(enc_out)
+        hyps = self.search_algorithm(enc_out, is_debug)
+        if is_debug:            
+            bs_time = hyps[1]
+            hyps = hyps[0]            
+        
         self.search_cache = hyps
         
-#         #if not is_final:
         self.store()
-        hyps_r = self.search_algorithm(enc_out_r)
+        hyps_r = self.search_algorithm(enc_out_r, is_debug)
+        if is_debug:            
+            bs_time_r = hyps_r[1]
+            hyps_r = hyps_r[0]
+            bs_time = bs_time + bs_time_r
+            
         if enc_out_rr is not None:
             self.search_cache = hyps_r
-            hyps_rr = self.search_algorithm(enc_out_rr)            
+            hyps_rr = self.search_algorithm(enc_out_rr, is_debug)
+            if is_debug:            
+                bs_time_rr = hyps_rr[1]
+                hyps_rr = hyps_rr[0]
+            
+                bs_time = bs_time + bs_time_rr
         else:
             hyps_rr = None            
         self.restore()
         
-        if is_final:
-            #logging.warning("is_final")
+        if is_final:        
             self.reset_inference_cache()
             
-#             out = self.sort_nbest(hyps)
-#             return out, out, out
-
             if hyps_rr is not None:
                 return self.sort_nbest(hyps), self.sort_nbest(hyps_r), self.sort_nbest(hyps_rr)
             else:
-                return self.sort_nbest(hyps), self.sort_nbest(hyps_r), None        
-
+                return self.sort_nbest(hyps), self.sort_nbest(hyps_r), None 
+            
+        if is_debug:                        
+            if hyps_rr is not None:
+                return (hyps, hyps_r, hyps_rr), bs_time
+            else:
+                return (hyps, hyps_r, None), bs_time
+            
+            
         if hyps_rr is not None:
             return hyps, hyps_r, hyps_rr
         else:
@@ -201,19 +219,19 @@ class BeamSearchParallelTransducer:
     
     def store(self):
         """Store parameters."""
-        self.decoder.score_cache_tmp = self.decoder.score_cache.copy()
+        #self.decoder.score_cache_tmp = self.decoder.score_cache.copy()
         self.search_cache_tmp = copy.deepcopy(self.search_cache)        
         
     def restore(self):
         """Restore parameters."""
-        self.decoder.score_cache = self.decoder.score_cache_tmp.copy()
+        #self.decoder.score_cache = self.decoder.score_cache_tmp.copy()
         self.search_cache = copy.deepcopy(self.search_cache_tmp)
-        self.decoder.score_cache_tmp = {}
+        #self.decoder.score_cache_tmp = {}
         self.search_cache_tmp = None
 
     def reset_inference_cache(self) -> None:
         """Reset cache for decoder scoring and streaming."""
-        self.decoder.score_cache = {}
+        #self.decoder.score_cache = {}
         self.search_cache = None
 
     def sort_nbest(self, hyps: List[Hypothesis]) -> List[Hypothesis]:
@@ -300,7 +318,7 @@ class BeamSearchParallelTransducer:
             device=self.decoder.device,
         )
 
-    def default_beam_search(self, enc_out: torch.Tensor) -> List[Hypothesis]:
+    def default_beam_search(self, enc_out: torch.Tensor, is_debug: bool = False) -> List[Hypothesis]:
         """Beam search implementation without prefix search.
         Modified from https://arxiv.org/pdf/1211.3711.pdf
         Args:
@@ -322,6 +340,8 @@ class BeamSearchParallelTransducer:
                 )
             ]
 
+        total_decoder_time = 0
+        search_start = time.perf_counter()
         for t in range(max_t):
             hyps = kept_hyps
             kept_hyps = []
@@ -338,6 +358,8 @@ class BeamSearchParallelTransducer:
                     device=self.decoder.device,
                 )
                 
+                start = time.perf_counter()
+                
                 dec_out, state, _ = self.decoder.score(
                     max_hyp,
                     cache,
@@ -353,6 +375,10 @@ class BeamSearchParallelTransducer:
                     self.joint_network(enc_out[t : t + 1, :], dec_out),
                     dim=-1,
                 ).squeeze(0)
+    
+                end = time.perf_counter()
+                total_decoder_time += (end-start)
+    
                 top_k = logp[1:].topk(beam_k, dim=-1)
 
                 kept_hyps.append(
@@ -402,7 +428,13 @@ class BeamSearchParallelTransducer:
                 if len(kept_most_prob) >= self.beam_size:
                     kept_hyps = kept_most_prob
                     break
-                                   
+
+        search_end = time.perf_counter()                    
+        if is_debug:            
+            bs_time = (search_end-search_start)-total_decoder_time
+            return kept_hyps, bs_time
+        
+#         logging.warning("decode: {:.5f}, {:.5f}, {:.5f}".format(search_end-search_start, total_decoder_time, (search_end-search_start)-total_decoder_time))
         return kept_hyps
     
     def greedy_search(self, enc_out: torch.Tensor) -> List[Hypothesis]:
@@ -616,6 +648,7 @@ class BeamSearchParallelTransducer:
     def modified_adaptive_expansion_search(
         self,
         enc_out: torch.Tensor,
+        is_debug: bool = False,
     ) -> List[ExtendedHypothesis]:
         """Modified version of Adaptive Expansion Search (mAES).
         Based on AES (https://ieeexplore.ieee.org/document/9250505) and
@@ -625,6 +658,10 @@ class BeamSearchParallelTransducer:
         Returns:
             nbest_hyps: N-best hypothesis.
         """
+        
+        total_decoder_time = 0
+        search_start = time.perf_counter()
+        
         if self.search_cache is not None:
             kept_hyps = self.search_cache
         else:
@@ -636,9 +673,12 @@ class BeamSearchParallelTransducer:
                 )
             ]
 
+            start = time.perf_counter()           
             beam_dec_out, beam_state = self.decoder.batch_score(
                 init_tokens,
             )
+            end = time.perf_counter()
+            total_decoder_time += (end-start)
 
             if self.use_lm:
                 beam_lm_scores, beam_lm_states = self.lm.batch_score(
@@ -663,7 +703,7 @@ class BeamSearchParallelTransducer:
                     lm_score=lm_score,
                 )
             ]
-
+        
         for enc_out_t in enc_out:
             hyps = kept_hyps
             kept_hyps = []
@@ -673,11 +713,14 @@ class BeamSearchParallelTransducer:
             list_b = []
             for n in range(self.nstep):
                 beam_dec_out = torch.stack([h.dec_out for h in hyps])
-
+                
+                start = time.perf_counter()
                 beam_logp, beam_idx = torch.log_softmax(
                     self.joint_network(beam_enc_out, beam_dec_out),
                     dim=-1,
                 ).topk(self.max_candidates, dim=-1)
+                end = time.perf_counter()
+                total_decoder_time += (end-start)
 
                 k_expansions = self.select_k_expansions(hyps, beam_idx, beam_logp)
 
@@ -710,9 +753,12 @@ class BeamSearchParallelTransducer:
 
                     break
                 else:
+                    start = time.perf_counter()
                     beam_dec_out, beam_state = self.decoder.batch_score(
                         list_exp,
                     )
+                    end = time.perf_counter()
+                    total_decoder_time += (end-start)
 
                     if self.use_lm:
                         beam_lm_scores, beam_lm_states = self.lm.batch_score(
@@ -732,25 +778,35 @@ class BeamSearchParallelTransducer:
 
                         hyps = list_exp[:]
                     else:
+                        start = time.perf_counter()
                         beam_logp = torch.log_softmax(
                             self.joint_network(beam_enc_out, beam_dec_out),
                             dim=-1,
                         )
-
+                        end = time.perf_counter()
+                        total_decoder_time += (end-start)
+                        
                         for i, hyp in enumerate(list_exp):
                             hyp.score += float(beam_logp[i, 0])
 
                             hyp.dec_out = beam_dec_out[i]
                             hyp.dec_state = self.decoder.select_state(beam_state, i)
-
+                                                       
                             if self.use_lm:
                                 hyp.lm_state = beam_lm_states[i]
                                 hyp.lm_score = beam_lm_scores[i]
-
+                                
                         kept_hyps = sorted(
                             self.recombine_hyps(list_b + list_exp),
                             key=lambda x: x.score,
                             reverse=True,
                         )[: self.beam_size]
 
+        search_end = time.perf_counter()
+        if is_debug:            
+            bs_time = (search_end-search_start)-total_decoder_time
+            return kept_hyps, bs_time
+        
+#         logging.warning("decode: {:.5f}, {:.5f}, {:.5f}".format(search_end-search_start, total_decoder_time, (search_end-search_start)-total_decoder_time))
         return kept_hyps
+

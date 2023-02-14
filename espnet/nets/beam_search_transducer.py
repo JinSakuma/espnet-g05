@@ -77,6 +77,7 @@ class BeamSearchTransducer:
         if self.beam_size <= 1:
             self.search_algorithm = self.greedy_search
         elif search_type == "default":
+            logging.warning("default")
             self.search_algorithm = self.default_beam_search
         elif search_type == "tsd":
             self.max_sym_exp = max_sym_exp
@@ -272,6 +273,8 @@ class BeamSearchTransducer:
                 max_hyp = max(hyps, key=lambda x: x.score)
                 hyps.remove(max_hyp)
 
+                logging.warning("cache")
+                logging.warning(cache)
                 dec_out, state, lm_tokens = self.decoder.score(max_hyp, cache)
 
                 logp = torch.log_softmax(

@@ -15,19 +15,18 @@ from torch import nn
 
 class MultiHeadedAttention(nn.Module):
     """Multi-Head Attention layer.
-
     Args:
         n_head (int): The number of heads.
         n_feat (int): The number of features.
         dropout_rate (float): Dropout rate.
-
     """
 
-    def __init__(self, n_head, n_feat, dropout_rate):
+    def __init__(self, n_head, n_feat, dropout_rate, streaming=False):
         """Construct an MultiHeadedAttention object."""
         super(MultiHeadedAttention, self).__init__()
         assert n_feat % n_head == 0
         # We assume d_v always equals d_k
+        self.streaming = streaming
         self.d_k = n_feat // n_head
         self.h = n_head
         self.linear_q = nn.Linear(n_feat, n_feat)
@@ -36,20 +35,39 @@ class MultiHeadedAttention(nn.Module):
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.attn = None
         self.dropout = nn.Dropout(p=dropout_rate)
+        # PETER: create a global attention mask with different chunk_size
+        # PETER: manually adjust streaming flag
+        if self.streaming:
+            self.att_msk = self.attention_mask(1100, 1100, 3).unsqueeze(1)
+            # self.att_msk = self.attention_mask(1000, 1000, 3).unsqueeze(1)
+
+    # PETER: chunk-wise attention mask
+    def attention_mask(self, time1, time2, chunk_size, device="cuda"):
+        b_size = chunk_size
+        time1tmp = time1 + b_size
+        time2tmp = time2 + b_size
+        v1 = torch.ones(1, 2 * b_size, dtype=torch.float64)
+        v2 = torch.zeros(1, time1tmp - b_size, dtype=torch.float64)
+        v3 = torch.cat([v1, v2], dim=1)
+        v4 = v3.repeat((1, time2tmp // b_size))
+        v4 = v4[:, :(v4.shape[1]//time1tmp * time1tmp)]
+        v4 = v4.reshape(-1, time1tmp)
+        v4 = v4.repeat((1, b_size)).reshape((-1, time1tmp))
+        v4 = v4[:time2, :time1].T + torch.ones((time1, time2), dtype=torch.float64).tril(0)
+        v4 = v4.unsqueeze(0)
+        att_msk = v4
+        return att_msk.eq(0) #.to(device=device)
 
     def forward_qkv(self, query, key, value):
         """Transform query, key and value.
-
         Args:
             query (torch.Tensor): Query tensor (#batch, time1, size).
             key (torch.Tensor): Key tensor (#batch, time2, size).
             value (torch.Tensor): Value tensor (#batch, time2, size).
-
         Returns:
             torch.Tensor: Transformed query tensor (#batch, n_head, time1, d_k).
             torch.Tensor: Transformed key tensor (#batch, n_head, time2, d_k).
             torch.Tensor: Transformed value tensor (#batch, n_head, time2, d_k).
-
         """
         n_batch = query.size(0)
         q = self.linear_q(query).view(n_batch, -1, self.h, self.d_k)
@@ -63,29 +81,40 @@ class MultiHeadedAttention(nn.Module):
 
     def forward_attention(self, value, scores, mask):
         """Compute attention context vector.
-
         Args:
             value (torch.Tensor): Transformed value (#batch, n_head, time2, d_k).
             scores (torch.Tensor): Attention score (#batch, n_head, time1, time2).
             mask (torch.Tensor): Mask (#batch, 1, time2) or (#batch, time1, time2).
-
         Returns:
             torch.Tensor: Transformed value (#batch, time1, d_model)
                 weighted by the attention score (#batch, time1, time2).
-
         """
+        if self.streaming:
+            device=value.device
+            self.att_msk = self.att_msk#.to(device)
         n_batch = value.size(0)
         if mask is not None:
             mask = mask.unsqueeze(1).eq(0)  # (batch, 1, *, time2)
             min_value = float(
                 numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min
             )
-            scores = scores.masked_fill(mask, min_value)
-            self.attn = torch.softmax(scores, dim=-1).masked_fill(
-                mask, 0.0
-            )  # (batch, head, time1, time2)
+            if self.streaming:
+                scores = scores.masked_fill(mask, min_value).masked_fill(self.att_msk[:,:,:scores.size(2),:scores.size(3)].to(device), min_value)
+                self.attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0).masked_fill(self.att_msk[:,:,:scores.size(2),:scores.size(3)].to(device), 0.0)
+            else:
+                scores = scores.masked_fill(mask, min_value)
+                self.attn = torch.softmax(scores, dim=-1).masked_fill(
+                    mask, 0.0
+                )  # (batch, head, time1, time2)
         else:
-            self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
+            if self.streaming:
+                min_value = float(
+                    numpy.finfo(torch.tensor(0, dtype=scores.dtype).numpy().dtype).min
+                )
+                scores = scores.masked_fill(self.att_msk[:,:,:scores.size(2),:scores.size(3)], min_value)
+                self.attn = torch.softmax(scores, dim=-1).masked_fill(self.att_msk[:,:,:scores.size(2),:scores.size(3)], 0.0)  # (batch, head, time1, time2)
+            else:
+                self.attn = torch.softmax(scores, dim=-1)  # (batch, head, time1, time2)
 
         p_attn = self.dropout(self.attn)
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
@@ -97,17 +126,14 @@ class MultiHeadedAttention(nn.Module):
 
     def forward(self, query, key, value, mask):
         """Compute scaled dot product attention.
-
         Args:
             query (torch.Tensor): Query tensor (#batch, time1, size).
             key (torch.Tensor): Key tensor (#batch, time2, size).
             value (torch.Tensor): Value tensor (#batch, time2, size).
             mask (torch.Tensor): Mask tensor (#batch, 1, time2) or
                 (#batch, time1, time2).
-
         Returns:
             torch.Tensor: Output tensor (#batch, time1, d_model).
-
         """
         q, k, v = self.forward_qkv(query, key, value)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)

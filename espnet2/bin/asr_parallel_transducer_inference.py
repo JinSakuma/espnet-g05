@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 import math
 import sys
 from pathlib import Path
@@ -196,7 +197,7 @@ class Speech2Text:
             raise NotImplemented
 
         self.window_size = 20
-        size = 4
+        size = hop_size  # 4
         kernel_2, stride_2 = 3, 2  # sub = 4
         self._raw_ctx = (((size + 2) * 2) + (kernel_2 - 1) * stride_2) * self.hop_length
         
@@ -230,8 +231,14 @@ class Speech2Text:
             feats: Features sequence. (1, T_in, F)
             feats_lengths: Features sequence length. (1, T_in, F)
         """
-        if self.frontend_cache is not None:
+        if self.frontend_cache is not None: 
+#             print(self.frontend_cache["waveform_buffer"].shape)
             speech = torch.cat([self.frontend_cache["waveform_buffer"], speech], dim=0)
+        else:
+            pad = torch.zeros(
+                384, dtype=speech.dtype
+            )
+            speech = torch.cat([pad, speech], dim=0)
 
         if is_final:
 #             if self.streaming and speech.size(0) < self.last_chunk_length:
@@ -271,10 +278,13 @@ class Speech2Text:
         lengths = speech_to_process.new_full(
             [1], dtype=torch.long, fill_value=speech_to_process.size(1)
         )
-        batch = {"speech": speech_to_process, "speech_lengths": lengths}
+        
+#         print("speech: {}, length: {}".format(speech.shape, lengths))
+        batch = {"speech": speech_to_process, "speech_lengths": lengths, "center": True}
         batch = to_device(batch, device=self.device)
 
         feats, feats_lengths = self.asr_model._extract_feats(**batch)
+#         print("feats: {}, length: {}".format(feats.shape, feats_lengths))
         if self.asr_model.normalize is not None:
             feats, feats_lengths = self.asr_model.normalize(feats, feats_lengths)
 
@@ -293,27 +303,27 @@ class Speech2Text:
                     ),
                 )
         else:
-            if self.frontend_cache is None:
-                feats = feats.narrow(
-                    1,
-                    0,
-                    feats.size(1)
-                    - math.ceil(
-                        math.ceil(self.frontend_window_size / self.hop_length) / 2
-                    ),
-                )
-            else:
-                feats = feats.narrow(
-                    1,
-                    math.ceil(
-                        math.ceil(self.frontend_window_size / self.hop_length) / 2
-                    ),
-                    feats.size(1)
-                    - 2
-                    * math.ceil(
-                        math.ceil(self.frontend_window_size / self.hop_length) / 2
-                    ),
-                )
+#             if self.frontend_cache is None:
+#                 feats = feats.narrow(
+#                     1,
+#                     0,
+#                     feats.size(1)
+#                     - math.ceil(
+#                         math.ceil(self.frontend_window_size / self.hop_length) / 2
+#                     ),
+#                 )
+#             else:
+            feats = feats.narrow(
+                1,
+                math.ceil(
+                    math.ceil(self.frontend_window_size / self.hop_length) / 2
+                ),
+                feats.size(1)
+                - 2
+                * math.ceil(
+                    math.ceil(self.frontend_window_size / self.hop_length) / 2
+                ),
+            )
 
         feats_lengths = feats.new_full([1], dtype=torch.long, fill_value=feats.size(1))
 
@@ -329,6 +339,7 @@ class Speech2Text:
         self,
         speech: Union[torch.Tensor, np.ndarray],
         is_final: bool = True,
+        is_debug: bool = False,
     ) -> List[Hypothesis]:
         """Speech2Text streaming call.
         Args:
@@ -340,8 +351,13 @@ class Speech2Text:
         if isinstance(speech, np.ndarray):
             speech = torch.tensor(speech)
 
+#         start = time.perf_counter()
         feats, feats_length = self.apply_frontend(speech, is_final=is_final)
 
+#         end = time.perf_counter()
+#         logging.warning("feature: {:.5f}".format(end-start))
+        start = time.perf_counter()        
+        
         enc_out, _, self.encoder_states = self.asr_model.encoder(
             feats,
             feats_length,            
@@ -357,12 +373,28 @@ class Speech2Text:
         else:            
             enc_out_rr = None
             
+        end = time.perf_counter()
+        enc_time = end-start
+#         logging.warning("encode: {:.5f}".format(end-start))
+#         start = time.perf_counter()
+
+            
         enc_out = enc_out[0][0]
-        nbest_hyps = self.beam_search(enc_out, enc_out_r, enc_out_rr, is_final=is_final)
+        st_dec = time.perf_counter()        
+        nbest_hyps = self.beam_search(enc_out, enc_out_r, enc_out_rr, is_final=is_final, is_debug=is_debug)
+        if is_debug:
+            bs_time = nbest_hyps[1]
+            nbest_hyps = nbest_hyps[0]
+        
+#         end = time.perf_counter()
+#         logging.warning("search: {:.5f}".format(end-start))
 
         if is_final:
             self.reset_inference_cache()
             
+        if is_debug:
+            return (nbest_hyps[0], nbest_hyps[1], nbest_hyps[2]), enc_time, st_dec, bs_time
+    
         return (nbest_hyps[0], nbest_hyps[1], nbest_hyps[2])
 
     @torch.no_grad()
@@ -468,6 +500,7 @@ def inference(
     left_context: Optional[int],
     right_context: Optional[int],
     display_partial_hypotheses: bool,
+    is_debug: bool = False
 ) -> None:
     """Transducer model inference.
     Args:
@@ -560,6 +593,10 @@ def inference(
         allow_variable_data_keys=allow_variable_data_keys,
         inference=True,
     )
+    
+    
+    ### Important####
+    is_debug=False
 
     # 4 .Start for-loop
     with DatadirWriter(output_dir) as writer:
@@ -577,24 +614,48 @@ def inference(
             try:
                 if speech2text.streaming:
                     speech = batch["speech"]
+                    
+                    if len(speech) <= speech2text._raw_ctx*4:
+                        add = speech2text._raw_ctx*4 - len(speech) + 1
+                        pad = np.zeros(speech2text._raw_ctx*1+add)
+                    else:
+                        pad = np.zeros(speech2text._raw_ctx*1)
 
+#                     if len(speech) <= speech2text._raw_ctx*3:
+#                         add = speech2text._raw_ctx*3 - len(speech) + 1
+#                         pad = np.zeros(speech2text._raw_ctx*3+add)
+#                     else:
+#                         pad = np.zeros(speech2text._raw_ctx*3)
+
+                    speech = np.concatenate([speech, pad])
+                    
                     _steps = len(speech) // speech2text._raw_ctx
-                    if speech2text.is_3step:
-                        _steps -= 1
+#                     if speech2text.is_3step:
+#                         _steps -= 1
                     
                     _end = 0
 
+                    enct_list = []
+                    bst_list = []
+                    dect_list = [] 
                     for i in range(_steps):                        
                         _end = (i + 1) * speech2text._raw_ctx
 
                         final_hyps = speech2text.streaming_decode(
-                            speech[i * speech2text._raw_ctx : _end], is_final=False
+                            speech[i * speech2text._raw_ctx : _end], is_final=False, is_debug=is_debug
                         )
+                        
+                        if is_debug:
+                            et_dec = time.perf_counter()
+                            final_hyps, enc_time, st_dec, bs_time = final_hyps   
+                            enct_list.append(enc_time)
+                            bst_list.append(bs_time)
+                            dect_list.append(et_dec - st_dec)
                     
-                    if _steps < 1:
-                        final_hyps = speech2text.streaming_decode(
-                            speech[_end : len(speech)], is_final=True
-                        )
+#                     if _steps < 1:
+#                     final_hyps = speech2text.streaming_decode(
+#                         speech[_end : len(speech)], is_final=False
+#                     )
                 else:
                     final_hyps = speech2text(**batch)
 
@@ -606,6 +667,12 @@ def inference(
                 logging.warning(f"Utterance {keys} {e}")
                 hyp = Hypothesis(score=0.0, yseq=[], dec_state=None)
                 results = [[" ", ["<space>"], [2], hyp]] * nbest
+            
+            if is_debug:
+                enct_avg = round(sum(enct_list) / _steps,5)
+                dect_avg = round(sum(dect_list) / _steps,5)
+                bst_avg = round(sum(bst_list) / _steps,5)
+                logging.warning(f"enct_avg: {enct_avg}, dect_avg: {dect_avg}, bst_avg: {bst_avg}")
 
             key = keys[0]
             for n, (text, token, token_int, hyp) in zip(range(1, nbest + 1), results):

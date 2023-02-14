@@ -136,6 +136,8 @@ class Speech2Text:
 
         # 4. Build BeamSearch object
         if asr_model.use_transducer_decoder:
+            logging.warning("transducer_conf")
+            logging.warning(transducer_conf)
             beam_search_transducer = BeamSearchTransducer(
                 decoder=asr_model.decoder,
                 joint_network=asr_model.joint_network,

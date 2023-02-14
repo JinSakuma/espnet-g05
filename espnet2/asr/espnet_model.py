@@ -64,6 +64,7 @@ class ESPnetASRModel(AbsESPnetModel):
         sym_space: str = "<space>",
         sym_blank: str = "<blank>",
         extract_feats_in_collect_stats: bool = True,
+        fastemit_lambda: float = 0.0,
     ):
         assert check_argument_types()
         assert 0.0 <= ctc_weight <= 1.0, ctc_weight
@@ -72,6 +73,7 @@ class ESPnetASRModel(AbsESPnetModel):
         super().__init__()
         # note that eos is the same as sos (equivalent ID)
         self.blank_id = 0
+        #self.sos = vocab_size - 2
         self.sos = vocab_size - 1
         self.eos = vocab_size - 1
         self.vocab_size = vocab_size
@@ -86,6 +88,7 @@ class ESPnetASRModel(AbsESPnetModel):
         self.preencoder = preencoder
         self.postencoder = postencoder
         self.encoder = encoder
+        self.fastemit_lambda = fastemit_lambda
 
         if not hasattr(self.encoder, "interctc_use_conditioning"):
             self.encoder.interctc_use_conditioning = False
@@ -106,7 +109,7 @@ class ESPnetASRModel(AbsESPnetModel):
 
             self.criterion_transducer = RNNTLoss(
                 blank=self.blank_id,
-                fastemit_lambda=0.0,
+                fastemit_lambda=fastemit_lambda,
             )
 
             if report_cer or report_wer:
@@ -187,6 +190,7 @@ class ESPnetASRModel(AbsESPnetModel):
 
         # 1. Encoder
         encoder_out, encoder_out_lens = self.encode(speech, speech_lengths)
+        #logging.warning("Encoded!!!!!!")
         intermediate_outs = None
         if isinstance(encoder_out, tuple):
             intermediate_outs = encoder_out[1]
@@ -363,7 +367,7 @@ class ESPnetASRModel(AbsESPnetModel):
         return encoder_out, encoder_out_lens
 
     def _extract_feats(
-        self, speech: torch.Tensor, speech_lengths: torch.Tensor
+        self, speech: torch.Tensor, speech_lengths: torch.Tensor, center: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert speech_lengths.dim() == 1, speech_lengths.shape
 
@@ -375,7 +379,7 @@ class ESPnetASRModel(AbsESPnetModel):
             #  e.g. STFT and Feature extract
             #       data_loader may send time-domain signal in this case
             # speech (Batch, NSamples) -> feats: (Batch, NFrames, Dim)
-            feats, feats_lengths = self.frontend(speech, speech_lengths)
+            feats, feats_lengths = self.frontend(speech, speech_lengths, center)
         else:
             # No frontend and no feature extract
             feats, feats_lengths = speech, speech_lengths

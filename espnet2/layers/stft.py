@@ -56,7 +56,7 @@ class Stft(torch.nn.Module, InversibleInterface):
         )
 
     def forward(
-        self, input: torch.Tensor, ilens: torch.Tensor = None
+        self, input: torch.Tensor, ilens: torch.Tensor = None, center: bool = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """STFT forward function.
 
@@ -67,6 +67,11 @@ class Stft(torch.nn.Module, InversibleInterface):
             output: (Batch, Frames, Freq, 2) or (Batch, Frames, Channels, Freq, 2)
 
         """
+        if center is None:
+            center = self.center
+        else:
+            self.center = center
+        
         bs = input.size(0)
         if input.dim() == 3:
             multi_channel = True
@@ -117,7 +122,8 @@ class Stft(torch.nn.Module, InversibleInterface):
                 n_fft=self.n_fft,
                 win_length=self.win_length,
                 hop_length=self.hop_length,
-                center=self.center,
+                center=center,
+#                 center=self.center,
                 window=window,
             )
 

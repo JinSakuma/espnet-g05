@@ -193,70 +193,89 @@ class TransducerDecoder(AbsDecoder):
 
         return dec_out[0][0], dec_state, label[0]
 
+#     def batch_score(
+#         self,
+#         hyps: Union[List[Hypothesis], List[ExtendedHypothesis]],
+#         dec_states: Tuple[torch.Tensor, Optional[torch.Tensor]],
+#         cache: Dict[str, Any],
+#         use_lm: bool,
+#     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+#         """One-step forward hypotheses.
+
+#         Args:
+#             hyps: Hypotheses.
+#             states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
+#             cache: Pairs of (dec_out, dec_states) for each label sequences. (keys)
+#             use_lm: Whether to compute label ID sequences for LM.
+
+#         Returns:
+#             dec_out: Decoder output sequences. (B, D_dec)
+#             dec_states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
+#             lm_labels: Label ID sequences for LM. (B,)
+
+#         """
+#         final_batch = len(hyps)
+
+#         process = []
+#         done = [None] * final_batch
+
+#         for i, hyp in enumerate(hyps):
+#             str_labels = "_".join(list(map(str, hyp.yseq)))
+
+#             if str_labels in cache:
+#                 done[i] = cache[str_labels]
+#             else:
+#                 process.append((str_labels, hyp.yseq[-1], hyp.dec_state))
+
+#         if process:
+#             labels = torch.LongTensor([[p[1]] for p in process], device=self.device)
+#             p_dec_states = self.create_batch_states(
+#                 self.init_state(labels.size(0)), [p[2] for p in process]
+#             )
+
+#             dec_emb = self.embed(labels)
+#             dec_out, new_states = self.rnn_forward(dec_emb, p_dec_states)
+
+#         j = 0
+#         for i in range(final_batch):
+#             if done[i] is None:
+#                 state = self.select_state(new_states, j)
+
+#                 done[i] = (dec_out[j], state)
+#                 cache[process[j][0]] = (dec_out[j], state)
+
+#                 j += 1
+
+#         dec_out = torch.cat([d[0] for d in done], dim=0)
+#         dec_states = self.create_batch_states(dec_states, [d[1] for d in done])
+
+#         if use_lm:
+#             lm_labels = torch.LongTensor(
+#                 [h.yseq[-1] for h in hyps], device=self.device
+#             ).view(final_batch, 1)
+
+#             return dec_out, dec_states, lm_labels
+
+#         return dec_out, dec_states, None
+
     def batch_score(
         self,
-        hyps: Union[List[Hypothesis], List[ExtendedHypothesis]],
-        dec_states: Tuple[torch.Tensor, Optional[torch.Tensor]],
-        cache: Dict[str, Any],
-        use_lm: bool,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        hyps: List[Hypothesis],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """One-step forward hypotheses.
-
         Args:
             hyps: Hypotheses.
-            states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
-            cache: Pairs of (dec_out, dec_states) for each label sequences. (keys)
-            use_lm: Whether to compute label ID sequences for LM.
-
         Returns:
             dec_out: Decoder output sequences. (B, D_dec)
-            dec_states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
-            lm_labels: Label ID sequences for LM. (B,)
-
+            states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec) or None)
         """
-        final_batch = len(hyps)
+        labels = torch.LongTensor([[h.yseq[-1]] for h in hyps], device=self.device)
+        dec_embed = self.embed(labels)
 
-        process = []
-        done = [None] * final_batch
+        states = self.create_batch_states([h.dec_state for h in hyps])
+        dec_out, states = self.rnn_forward(dec_embed, states)
 
-        for i, hyp in enumerate(hyps):
-            str_labels = "_".join(list(map(str, hyp.yseq)))
-
-            if str_labels in cache:
-                done[i] = cache[str_labels]
-            else:
-                process.append((str_labels, hyp.yseq[-1], hyp.dec_state))
-
-        if process:
-            labels = torch.LongTensor([[p[1]] for p in process], device=self.device)
-            p_dec_states = self.create_batch_states(
-                self.init_state(labels.size(0)), [p[2] for p in process]
-            )
-
-            dec_emb = self.embed(labels)
-            dec_out, new_states = self.rnn_forward(dec_emb, p_dec_states)
-
-        j = 0
-        for i in range(final_batch):
-            if done[i] is None:
-                state = self.select_state(new_states, j)
-
-                done[i] = (dec_out[j], state)
-                cache[process[j][0]] = (dec_out[j], state)
-
-                j += 1
-
-        dec_out = torch.cat([d[0] for d in done], dim=0)
-        dec_states = self.create_batch_states(dec_states, [d[1] for d in done])
-
-        if use_lm:
-            lm_labels = torch.LongTensor(
-                [h.yseq[-1] for h in hyps], device=self.device
-            ).view(final_batch, 1)
-
-            return dec_out, dec_states, lm_labels
-
-        return dec_out, dec_states, None
+        return dec_out.squeeze(1), states
 
     def select_state(
         self, states: Tuple[torch.Tensor, Optional[torch.Tensor]], idx: int
@@ -277,21 +296,38 @@ class TransducerDecoder(AbsDecoder):
             states[1][:, idx : idx + 1, :] if self.dtype == "lstm" else None,
         )
 
+#     def create_batch_states(
+#         self,
+#         states: Tuple[torch.Tensor, Optional[torch.Tensor]],
+#         new_states: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
+#         check_list: Optional[List] = None,
+#     ) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+#         """Create decoder hidden states.
+
+#         Args:
+#             states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
+#             new_states: Decoder hidden states. [N x ((1, D_dec), (1, D_dec))]
+
+#         Returns:
+#             states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
+
+#         """
+#         return (
+#             torch.cat([s[0] for s in new_states], dim=1),
+#             torch.cat([s[1] for s in new_states], dim=1)
+#             if self.dtype == "lstm"
+#             else None,
+#         )
+
     def create_batch_states(
         self,
-        states: Tuple[torch.Tensor, Optional[torch.Tensor]],
         new_states: List[Tuple[torch.Tensor, Optional[torch.Tensor]]],
-        check_list: Optional[List] = None,
-    ) -> List[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Create decoder hidden states.
-
         Args:
-            states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
-            new_states: Decoder hidden states. [N x ((1, D_dec), (1, D_dec))]
-
+            new_states: Decoder hidden states. [N x ((1, D_dec), (1, D_dec) or None)]
         Returns:
-            states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec))
-
+            states: Decoder hidden states. ((N, B, D_dec), (N, B, D_dec) or None)
         """
         return (
             torch.cat([s[0] for s in new_states], dim=1),

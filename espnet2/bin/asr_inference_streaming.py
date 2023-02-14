@@ -13,6 +13,12 @@ from espnet2.asr.encoder.contextual_block_transformer_encoder import (
 from espnet2.asr.encoder.contextual_block_conformer_encoder import (
     ContextualBlockConformerEncoder,  # noqa: H301
 )
+from espnet2.asr.encoder.contextual_block_dual_delay_conformer_encoder import (
+    ContextualBlockDualDelayConformerEncoder,  # noqa: H301
+)
+from espnet2.asr.encoder.contextual_block_dual_delay_conformer_encoder2 import (
+    ContextualBlockDualDelayConformerEncoder2,  # noqa: H301
+)
 from espnet2.fileio.datadir_writer import DatadirWriter
 from espnet2.tasks.asr import ASRTask
 from espnet2.tasks.lm import LMTask
@@ -86,7 +92,10 @@ class Speech2TextStreaming:
 
         assert isinstance(
             asr_model.encoder, ContextualBlockTransformerEncoder
-        ) or isinstance(asr_model.encoder, ContextualBlockConformerEncoder)
+        ) or isinstance(asr_model.encoder, ContextualBlockConformerEncoder
+        ) or isinstance(asr_model.encoder, ContextualBlockDualDelayConformerEncoder
+        ) or isinstance(asr_model.encoder, ContextualBlockDualDelayConformerEncoder2
+        )
 
         decoder = asr_model.decoder
         ctc = CTCPrefixScorer(ctc=asr_model.ctc, eos=asr_model.eos)
@@ -116,9 +125,9 @@ class Speech2TextStreaming:
         assert "look_ahead" in asr_train_args.encoder_conf
         assert "hop_size" in asr_train_args.encoder_conf
         assert "block_size" in asr_train_args.encoder_conf
-        # look_ahead = asr_train_args.encoder_conf['look_ahead']
-        # hop_size   = asr_train_args.encoder_conf['hop_size']
-        # block_size = asr_train_args.encoder_conf['block_size']
+        look_ahead = asr_train_args.encoder_conf['look_ahead']
+        hop_size   = asr_train_args.encoder_conf['hop_size']
+        block_size = asr_train_args.encoder_conf['block_size']
 
         assert batch_size == 1
 
@@ -131,6 +140,9 @@ class Speech2TextStreaming:
             vocab_size=len(token_list),
             token_list=token_list,
             pre_beam_score_key=None if ctc_weight == 1.0 else "full",
+            block_size=block_size,
+            hop_size=hop_size,
+            look_ahead=look_ahead,
             disable_repetition_detection=disable_repetition_detection,
             decoder_text_length_limit=decoder_text_length_limit,
             encoded_feat_length_limit=encoded_feat_length_limit,
@@ -141,7 +153,7 @@ class Speech2TextStreaming:
             for k, v in beam_search.full_scorers.items()
             if not isinstance(v, BatchScorerInterface)
         ]
-        assert len(non_batch) == 0
+        assert len(non_batch) == 0, '{}'.format(non_batch)
 
         # TODO(karita): make all scorers batchfied
         logging.info("BatchBeamSearchOnline implementation is selected.")
@@ -272,7 +284,12 @@ class Speech2TextStreaming:
             is_final=is_final,
             infer_mode=True,
         )
-        nbest_hyps = self.beam_search(
+        
+        if isinstance(enc, tuple):            
+            enc = enc[0]
+        
+#         logging.warning(f"# enc shape: {enc.shape}")
+        nbest_hyps, block_idx = self.beam_search(
             x=enc[0],
             maxlenratio=self.maxlenratio,
             minlenratio=self.minlenratio,
@@ -282,7 +299,7 @@ class Speech2TextStreaming:
         ret = self.assemble_hyps(nbest_hyps)
         if is_final:
             self.reset()
-        return ret
+        return ret, block_idx
 
     def assemble_hyps(self, hyps):
         nbest_hyps = hyps[: self.nbest]
@@ -400,6 +417,9 @@ def inference(
     # FIXME(kamo): The output format should be discussed about
     with DatadirWriter(output_dir) as writer:
         for keys, batch in loader:
+            logging.warning("#####################")
+            logging.warning("Start new sample")            
+            logging.warning("#####################")
             assert isinstance(batch, dict), type(batch)
             assert all(isinstance(s, str) for s in keys), keys
             _bs = len(next(iter(batch.values())))
@@ -407,30 +427,44 @@ def inference(
             batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
             assert len(batch.keys()) == 1
 
+            end_idx = None
+            end_block = None
             try:
                 if sim_chunk_length == 0:
                     # N-best list of (text, token, token_int, hyp_object)
                     results = speech2text(**batch)
                 else:
                     speech = batch["speech"]
+                    logging.warning(f"# Input shape: {len(speech)}")
+                    max_i = len(speech) // sim_chunk_length
                     for i in range(len(speech) // sim_chunk_length):
+                        logging.warning("==================================")                        
+                        logging.warning(f"#InputID: {i}")
+                        logging.warning("==================================")
                         speech2text(
                             speech=speech[
                                 i * sim_chunk_length : (i + 1) * sim_chunk_length
                             ],
                             is_final=False,
                         )
-                    results = speech2text(
+                    
+                    logging.warning("==================================")
+                    logging.warning(f"#InputID: {i+1}")
+                    logging.warning("==================================")
+                    results, end_block = speech2text(
                         speech[(i + 1) * sim_chunk_length : len(speech)], is_final=True
                     )
+                    end_idx = i+1
+                    
             except TooShortUttError as e:
                 logging.warning(f"Utterance {keys} {e}")
                 hyp = Hypothesis(score=0.0, scores={}, states={}, yseq=[])
                 results = [[" ", ["<space>"], [2], hyp]] * nbest
-
+            
             # Only supporting batch_size==1
             key = keys[0]
             for n, (text, token, token_int, hyp) in zip(range(1, nbest + 1), results):
+                logging.warning(f"N: {n}, end_idx: {end_idx}, end_block: {end_block}")
                 # Create a directory: outdir/{n}best_recog
                 ibest_writer = writer[f"{n}best_recog"]
 
@@ -441,7 +475,10 @@ def inference(
 
                 if text is not None:
                     ibest_writer["text"][key] = text
-
+                    
+                if n == 1 and end_idx is not None and end_block is not None:                    
+                    ibest_writer["end_idx"][key] = str(end_idx)
+                    ibest_writer["end_block"][key] = str(end_block)
 
 def get_parser():
     parser = config_argparse.ArgumentParser(

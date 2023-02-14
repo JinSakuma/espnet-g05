@@ -19,6 +19,8 @@ from espnet.nets.pytorch_backend.transducer.utils import subtract
 from espnet2.asr.decoder.abs_decoder import AbsDecoder
 from espnet2.asr.transducer.joint_network import JointNetwork
 
+import logging
+
 
 @dataclass
 class Hypothesis:
@@ -260,6 +262,8 @@ class BeamSearchTransducer:
                 max_hyp = max(hyps, key=lambda x: x.score)
                 hyps.remove(max_hyp)
 
+                logging.warning("cache")
+                logging.warning(cache)
                 dec_out, state, lm_tokens = self.decoder.score(max_hyp, cache)
 
                 logp = torch.log_softmax(

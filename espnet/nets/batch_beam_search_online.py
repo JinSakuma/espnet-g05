@@ -8,6 +8,7 @@ from espnet.nets.beam_search import Hypothesis
 from espnet.nets.e2e_asr_common import end_detect
 import logging
 import torch
+import copy
 from typing import (
     List,  # noqa: H301
     Tuple,  # noqa: H301
@@ -15,7 +16,7 @@ from typing import (
     Any,  # noqa: H301
 )
 
-
+logging.basicConfig(level=logging.DEBUG)
 class BatchBeamSearchOnline(BatchBeamSearch):
     """Online beam search implementation.
 
@@ -41,6 +42,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
     ):
         """Initialize beam search."""
         super().__init__(*args, **kwargs)
+        self.eou = 5
         self.block_size = block_size
         self.hop_size = hop_size
         self.look_ahead = look_ahead
@@ -80,6 +82,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         scores = dict()
         states = dict()
         for k, d in self.full_scorers.items():
+            logging.debug("Decoder lengrh, H shape [0]: {}".format(len(hyp.yseq[0])))
             if (
                 self.decoder_text_length_limit > 0
                 and len(hyp.yseq) > 0
@@ -130,6 +133,7 @@ class BatchBeamSearchOnline(BatchBeamSearch):
         else:
             maxlen = max(1, int(maxlenratio * x.size(0)))
 
+        logging.debug("Start new chunk")
         ret = None
         while True:
             cur_end_frame = (
@@ -163,42 +167,56 @@ class BatchBeamSearchOnline(BatchBeamSearch):
 
             if self.running_hyps is None:
                 self.running_hyps = self.init_hyp(h)
-            ret = self.process_one_block(h, block_is_final, maxlen, maxlenratio)
+            
+            logging.debug("Encoder lengrh, H shape [0]: {}".format(h.shape[0]))
+            #ret = self.process_one_block(h, block_is_final, maxlen, maxlenratio)
+            ret, is_eou = self.process_one_block(h, block_is_final, maxlen, maxlenratio)
+#             if is_eou:
+#                 break
+                #return ret, self.processed_block
+            
             logging.debug("Finished processing block: %d", self.processed_block)
             self.processed_block += 1
             if block_is_final:
-                return ret
+                return ret, self.processed_block
+            
         if ret is None:
             if self.prev_output is None:
-                return []
+                return [], self.processed_block
             else:
-                return self.prev_output
+                return self.prev_output, self.processed_block
         else:
             self.prev_output = ret
             # N-best results
-            return ret
+            return ret, self.processed_block
 
     def process_one_block(self, h, is_final, maxlen, maxlenratio):
         """Recognize one block."""
         # extend states for ctc
         self.extend(h, self.running_hyps)
+        
         while self.process_idx < maxlen:
             logging.debug("position " + str(self.process_idx))
-            best = self.search(self.running_hyps, h)
-
+            
+            best = self.search(self.running_hyps, h)            
+            #a = copy.deepcopy(self.running_hyps)            
+            
             if self.process_idx == maxlen - 1:
                 # end decoding
                 self.running_hyps = self.post_process(
                     self.process_idx, maxlen, maxlenratio, best, self.ended_hyps
                 )
             n_batch = best.yseq.shape[0]
-            local_ended_hyps = []
+            local_ended_hyps = []                          
+            
             is_local_eos = best.yseq[torch.arange(n_batch), best.length - 1] == self.eos
             prev_repeat = False
             for i in range(is_local_eos.shape[0]):
                 if is_local_eos[i]:
                     hyp = self._select(best, i)
                     local_ended_hyps.append(hyp)
+#                     print('local eos')
+#                     print(hyp)
                 # NOTE(tsunoo): check repetitions here
                 # This is a implicit implementation of
                 # Eq (11) in https://arxiv.org/abs/2006.14941
@@ -278,6 +296,10 @@ class BatchBeamSearchOnline(BatchBeamSearch):
 
         # report the best result
         best = nbest_hyps[0]
+        if self.eou in best.yseq:
+            is_eou = True
+        else:
+            is_eou = False
         for k, v in best.scores.items():
             logging.info(
                 f"{v:6.2f} * {self.weights[k]:3} = {v * self.weights[k]:6.2f} for {k}"
@@ -291,7 +313,9 @@ class BatchBeamSearchOnline(BatchBeamSearch):
                 + "".join([self.token_list[x] for x in best.yseq[1:-1]])
                 + "\n"
             )
-        return nbest_hyps
+            
+#         return nbest_hyps
+        return nbest_hyps, is_eou
 
     def extend(self, x: torch.Tensor, hyps: Hypothesis) -> List[Hypothesis]:
         """Extend probabilities and states with more encoded chunks.

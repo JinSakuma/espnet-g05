@@ -34,6 +34,7 @@ from espnet2.asr.encoder.longformer_encoder import LongformerEncoder
 from espnet2.asr.encoder.hubert_encoder import FairseqHubertEncoder
 from espnet2.asr.encoder.hubert_encoder import FairseqHubertPretrainEncoder
 from espnet2.asr.encoder.rnn_encoder import RNNEncoder
+from espnet2.asr.encoder.mlp_encoder import MLPEncoder
 from espnet2.asr.encoder.transformer_encoder import TransformerEncoder
 from espnet2.asr.encoder.contextual_block_transformer_encoder import (
     ContextualBlockTransformerEncoder,  # noqa: H301
@@ -41,6 +42,16 @@ from espnet2.asr.encoder.contextual_block_transformer_encoder import (
 from espnet2.asr.encoder.contextual_block_conformer_encoder import (
     ContextualBlockConformerEncoder,  # noqa: H301
 )
+from espnet2.asr.encoder.contextual_block_parallel_conformer_encoder import (
+    ContextualBlockParallelConformerEncoder,  # noqa: H301
+)
+# from espnet2.asr.encoder.contextual_block_dual_delay_conformer_encoder import (
+#     ContextualBlockDualDelayConformerEncoder,  # editted by Jin Sakuma
+# )
+# from espnet2.asr.encoder.contextual_block_dual_delay_conformer_encoder2 import (
+#     ContextualBlockDualDelayConformerEncoder2,  # editted by Jin Sakuma
+# )
+
 from espnet2.asr.encoder.vgg_rnn_encoder import VGGRNNEncoder
 from espnet2.asr.encoder.wav2vec2_encoder import FairSeqWav2Vec2Encoder
 from espnet2.asr.espnet_model import ESPnetASRModel
@@ -50,6 +61,8 @@ from espnet2.asr.frontend.fused import FusedFrontends
 from espnet2.asr.frontend.s3prl import S3prlFrontend
 from espnet2.asr.frontend.windowing import SlidingWindow
 from espnet2.asr.maskctc_model import MaskCTCModel
+from espnet2.asr.dual_delay_model import DualDelayASRModel
+from espnet2.asr.dual_delay_model2 import DualDelayASRModel2
 from espnet2.asr.postencoder.abs_postencoder import AbsPostEncoder
 from espnet2.asr.postencoder.hugging_face_transformers_postencoder import (
     HuggingFaceTransformersPostEncoder,  # noqa: H301
@@ -113,6 +126,8 @@ model_choices = ClassChoices(
     "model",
     classes=dict(
         espnet=ESPnetASRModel,
+        dualdelay=DualDelayASRModel,
+        dualdelay2=DualDelayASRModel2,
         maskctc=MaskCTCModel,
     ),
     type_check=AbsESPnetModel,
@@ -131,10 +146,14 @@ preencoder_choices = ClassChoices(
 encoder_choices = ClassChoices(
     "encoder",
     classes=dict(
+        mlp=MLPEncoder,
         conformer=ConformerEncoder,
         transformer=TransformerEncoder,
         contextual_block_transformer=ContextualBlockTransformerEncoder,
         contextual_block_conformer=ContextualBlockConformerEncoder,
+        contextual_block_parallel_conformer=ContextualBlockParallelConformerEncoder,
+#         contextual_block_dual_delay_conformer=ContextualBlockDualDelayConformerEncoder,
+#         contextual_block_dual_delay_conformer2=ContextualBlockDualDelayConformerEncoder2,
         vgg_rnn=VGGRNNEncoder,
         rnn=RNNEncoder,
         wav2vec2=FairSeqWav2Vec2Encoder,
@@ -412,11 +431,11 @@ class ASRTask(AbsTask):
 
         # 1. frontend
         if args.input_size is None:
-            # Extract features in the model
+            # Extract features in the model           
             frontend_class = frontend_choices.get_class(args.frontend)
             frontend = frontend_class(**args.frontend_conf)
             input_size = frontend.output_size()
-        else:
+        else:            
             # Give features from data-loader
             args.frontend = None
             args.frontend_conf = {}

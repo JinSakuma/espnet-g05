@@ -229,6 +229,11 @@ class Speech2Text:
         """
         if self.frontend_cache is not None:
             speech = torch.cat([self.frontend_cache["waveform_buffer"], speech], dim=0)
+        else:
+            pad = torch.zeros(
+                384, dtype=speech.dtype
+            )
+            speech = torch.cat([pad, speech], dim=0)
 
         if is_final:
 #             if self.streaming and speech.size(0) < self.last_chunk_length:
@@ -290,27 +295,27 @@ class Speech2Text:
                     ),
                 )
         else:
-            if self.frontend_cache is None:
-                feats = feats.narrow(
-                    1,
-                    0,
-                    feats.size(1)
-                    - math.ceil(
-                        math.ceil(self.frontend_window_size / self.hop_length) / 2
-                    ),
-                )
-            else:
-                feats = feats.narrow(
-                    1,
-                    math.ceil(
-                        math.ceil(self.frontend_window_size / self.hop_length) / 2
-                    ),
-                    feats.size(1)
-                    - 2
-                    * math.ceil(
-                        math.ceil(self.frontend_window_size / self.hop_length) / 2
-                    ),
-                )
+#             if self.frontend_cache is None:
+#                 feats = feats.narrow(
+#                     1,
+#                     0,
+#                     feats.size(1)
+#                     - math.ceil(
+#                         math.ceil(self.frontend_window_size / self.hop_length) / 2
+#                     ),
+#                 )
+#             else:
+            feats = feats.narrow(
+                1,
+                math.ceil(
+                    math.ceil(self.frontend_window_size / self.hop_length) / 2
+                ),
+                feats.size(1)
+                - 2
+                * math.ceil(
+                    math.ceil(self.frontend_window_size / self.hop_length) / 2
+                ),
+            )
 
         feats_lengths = feats.new_full([1], dtype=torch.long, fill_value=feats.size(1))
 
@@ -587,10 +592,20 @@ def inference(
             assert len(keys) == _bs, f"{len(keys)} != {_bs}"
             batch = {k: v[0] for k, v in batch.items() if not k.endswith("_lengths")}
             assert len(batch.keys()) == 1
-
+            
+            speech2text.reset_inference_cache()
+            logging.warning("cache reset")
             try:
                 if speech2text.streaming:
                     speech = batch["speech"]
+                    
+                    if len(speech) <= speech2text._raw_ctx*4:
+                        add = speech2text._raw_ctx*4 - len(speech) + 1
+                        pad = np.zeros(speech2text._raw_ctx*3+add)
+                    else:
+                        pad = np.zeros(speech2text._raw_ctx*3)
+
+                    speech = np.concatenate([speech, pad])
 
                     _steps = len(speech) // speech2text._raw_ctx
                     _end = 0
@@ -598,17 +613,17 @@ def inference(
                     for i in range(_steps):
                         _end = (i + 1) * speech2text._raw_ctx
 
-                        speech2text.streaming_decode(
+                        final_hyps = speech2text.streaming_decode(
                             speech[i * speech2text._raw_ctx : _end], is_final=False
                         )
 
-                    final_hyps = speech2text.streaming_decode(
-                        speech[_end : len(speech)], is_final=True
-                    )
+#                     final_hyps = speech2text.streaming_decode(
+#                         speech[_end : len(speech)], is_final=False
+#                     )
                 else:
                     final_hyps = speech2text(**batch)
 
-                results = speech2text.hypotheses_to_results(final_hyps)
+                results = speech2text.hypotheses_to_results(speech2text.beam_search.sort_nbest(final_hyps))
             except TooShortUttError as e:
                 logging.warning(f"Utterance {keys} {e}")
                 hyp = Hypothesis(score=0.0, yseq=[], dec_state=None)

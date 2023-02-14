@@ -249,6 +249,7 @@ class TransformerDecoder(BaseTransformerDecoder):
         pos_enc_class=PositionalEncoding,
         normalize_before: bool = True,
         concat_after: bool = False,
+        streaming: bool = False,
     ):
         assert check_argument_types()
         super().__init__(
@@ -268,10 +269,10 @@ class TransformerDecoder(BaseTransformerDecoder):
             lambda lnum: DecoderLayer(
                 attention_dim,
                 MultiHeadedAttention(
-                    attention_heads, attention_dim, self_attention_dropout_rate
+                    attention_heads, attention_dim, self_attention_dropout_rate, streaming
                 ),
                 MultiHeadedAttention(
-                    attention_heads, attention_dim, src_attention_dropout_rate
+                    attention_heads, attention_dim, src_attention_dropout_rate, streaming
                 ),
                 PositionwiseFeedForward(attention_dim, linear_units, dropout_rate),
                 dropout_rate,

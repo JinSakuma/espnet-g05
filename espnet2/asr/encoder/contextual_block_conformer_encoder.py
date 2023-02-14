@@ -5,33 +5,32 @@ Created on Sat Aug 21 17:27:16 2021.
 @author: Keqi Deng (UCAS)
 """
 
-from espnet.nets.pytorch_backend.conformer.convolution import ConvolutionModule
+import math
+from typing import Optional,  Tuple
+import logging
+
+import torch
+from typeguard import check_argument_types
+
+from espnet2.asr.encoder.abs_encoder import AbsEncoder
 from espnet.nets.pytorch_backend.conformer.contextual_block_encoder_layer import (
     ContextualBlockEncoderLayer,  # noqa: H301
 )
-from espnet.nets.pytorch_backend.nets_utils import (
-    make_pad_mask,  # noqa: H301
-    get_activation,  # noqa: H301
-)
+from espnet.nets.pytorch_backend.conformer.convolution import ConvolutionModule
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask, get_activation
 from espnet.nets.pytorch_backend.transformer.attention import MultiHeadedAttention
 from espnet.nets.pytorch_backend.transformer.embedding import StreamPositionalEncoding
 from espnet.nets.pytorch_backend.transformer.layer_norm import LayerNorm
-from espnet.nets.pytorch_backend.transformer.multi_layer_conv import Conv1dLinear
-from espnet.nets.pytorch_backend.transformer.multi_layer_conv import MultiLayeredConv1d
+from espnet.nets.pytorch_backend.transformer.multi_layer_conv import (
+    Conv1dLinear,
+    MultiLayeredConv1d
+)
 from espnet.nets.pytorch_backend.transformer.positionwise_feed_forward import (
     PositionwiseFeedForward,  # noqa: H301
 )
 from espnet.nets.pytorch_backend.transformer.repeat import repeat
 from espnet.nets.pytorch_backend.transformer.subsampling_without_posenc import (
     Conv2dSubsamplingWOPosEnc,  # noqa: H301
-)
-from espnet2.asr.encoder.abs_encoder import AbsEncoder
-import math
-import torch
-from typeguard import check_argument_types
-from typing import (
-    Optional,  # noqa: H301
-    Tuple,  # noqa: H301
 )
 
 
@@ -92,6 +91,7 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         look_ahead: int = 16,
         init_average: bool = True,
         ctx_pos_enc: bool = True,
+        streaming: bool = False,
     ):
         assert check_argument_types()
         super().__init__()
@@ -178,7 +178,7 @@ class ContextualBlockConformerEncoder(AbsEncoder):
             lambda lnum: ContextualBlockEncoderLayer(
                 output_size,
                 MultiHeadedAttention(
-                    attention_heads, output_size, attention_dropout_rate
+                    attention_heads, output_size, attention_dropout_rate, streaming
                 ),
                 positionwise_layer(*positionwise_layer_args),
                 positionwise_layer(*positionwise_layer_args) if macaron_style else None,
@@ -563,6 +563,7 @@ class ContextualBlockConformerEncoder(AbsEncoder):
         ys_pad = xs_pad.new_zeros((xs_pad.size(0), y_length, xs_pad.size(2)))
         if n_processed_blocks == 0:
             ys_pad[:, 0:offset] = ys_chunk[:, 0, 0:offset]
+
         for i in range(block_num):
             cur_hop = i * self.hop_size
             if n_processed_blocks == 0:

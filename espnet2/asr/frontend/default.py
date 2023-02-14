@@ -82,14 +82,15 @@ class DefaultFrontend(AbsFrontend):
         return self.n_mels
 
     def forward(
-        self, input: torch.Tensor, input_lengths: torch.Tensor
+        self, input: torch.Tensor, input_lengths: torch.Tensor, center: bool = True
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Domain-conversion: e.g. Stft: time -> time-freq
         if self.stft is not None:
-            input_stft, feats_lens = self._compute_stft(input, input_lengths)
+            input_stft, feats_lens = self._compute_stft(input, input_lengths, center)
         else:
             input_stft = ComplexTensor(input[..., 0], input[..., 1])
             feats_lens = input_lengths
+            
         # 2. [Option] Speech enhancement
         if self.frontend is not None:
             assert isinstance(input_stft, ComplexTensor), type(input_stft)
@@ -119,9 +120,10 @@ class DefaultFrontend(AbsFrontend):
         return input_feats, feats_lens
 
     def _compute_stft(
-        self, input: torch.Tensor, input_lengths: torch.Tensor
+        self, input: torch.Tensor, input_lengths: torch.Tensor, center: bool=True,
     ) -> torch.Tensor:
-        input_stft, feats_lens = self.stft(input, input_lengths)
+        
+        input_stft, feats_lens = self.stft(input, input_lengths, center)
 
         assert input_stft.dim() >= 4, input_stft.shape
         # "2" refers to the real/imag parts of Complex
